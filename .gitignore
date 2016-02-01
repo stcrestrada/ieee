@@ -1,3 +1,4 @@
 .inenv
 .DS_STORE
 *.pyc
+.idea/
