@@ -3,9 +3,6 @@ from django.contrib.postgres.fields import JSONField
 
 from ieee.models import BaseModel
 
-"""
-
-"""
 
 class ScrapeHistory(BaseModel):
     SORT_FIELD = 'ti'
@@ -25,6 +22,5 @@ class ScrapeHistory(BaseModel):
 
 
 class ArticleModel(BaseModel):
-
     article_id = models.CharField(max_length=256)
     article_data = JSONField()

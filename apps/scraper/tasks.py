@@ -1,23 +1,26 @@
-from django.db import transaction
-from collections import namedtuple
-from collections import defaultdict
-import requests
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 
+import requests
 from celery import task
+from django.db import transaction
+from django.db import connection
 
 from apps.scraper.models import ArticleModel, ScrapeHistory
 
 QUERY_URL = 'https://ieeexplore.ieee.org/gateway/ipsSearch.jsp'
+
 
 def int_if_digit(val):
     if val and val.isdigit():
         val = int(val)
     return val
 
+
 SPECIAL_PROCESSORS = defaultdict(list)
 SPECIAL_PROCESSORS['authors'] = [lambda x: map(lambda x: x and x.strip(), (x or '') and x.split(';'))]
 SPECIAL_PROCESSORS['*'] = [int_if_digit]
+
 
 def parse_doc(elem):
     data = {}
@@ -34,14 +37,18 @@ def parse_doc(elem):
         data[prop_name] = prop_value
     return data
 
+
 @task
 def scrape_chunk(params):
     print "Scraping chunk with params {}".format(str(params))
-    history = ScrapeHistory.objects.create(state=ScrapeHistory.STATE_PROCESSING, pub_year=params['py'], limit=params['hc'], seq_number=params['rs'])
+    history = params.get('state_obj')
+    if not history:
+        history = ScrapeHistory.objects.create(state=ScrapeHistory.STATE_PROCESSING, pub_year=params['py'],
+                                               limit=params['hc'], seq_number=params['rs'])
     resp = requests.get(QUERY_URL, params=params, timeout=5)
     try:
         resp.raise_for_status()
-    except Exception:
+    except Exception as e:
         print "ERROR: {}".format(str(e))
         history.state = history.STATE_ERROR
         history.save()
@@ -75,9 +82,22 @@ def sequence_generator(total, chunk_size):
         current += chunk_size
         yield current
 
+
+def get_params(year, hc=None, rs=None, state_obj=None):
+    params = {'py': year, 'sortfield': 'ti', 'sortorder': 'asc'}
+    if hc:
+        params['hc'] = hc
+    if rs:
+        params['rs'] = rs
+    if state_obj:
+        params['state_obj'] = state_obj
+    return params
+
+
 @task
 def scrape_year(year):
-    base_params = {'py': year, 'sortfield' : 'ti', 'sortorder' : 'asc'}
+    print "Prepping scraping year {}".format(year)
+    base_params = get_params(year)
     resp_year = requests.get(QUERY_URL, params=base_params)
     resp_year.raise_for_status()
     tree = ET.fromstring(resp_year.content)
@@ -88,13 +108,36 @@ def scrape_year(year):
     assert node.tag == 'totalfound', "Tag not right."
     total_articles = int(node.text)
     chunk_size = ScrapeHistory.LIMIT
-    chunk_base_params = dict(base_params.copy().items() + [('hc', chunk_size)])
     sq_gen = sequence_generator(total_articles, chunk_size)
-    args_of_requests = [dict(chunk_base_params.items() + [('rs', each)]) for each in sq_gen]
+    args_of_requests = [get_params(year, hc=ScrapeHistory.LIMIT, rs=rs) for rs in sq_gen]
     for each in args_of_requests:
         scrape_chunk.apply_async([each])
+    print "Done prepping scraping year {}".format(year)
+
 
 @task
 def scrape_all():
-    for each in range(1880, 2016):
+    for each in range(1872, 2017):
         scrape_year.apply_async([each])
+
+
+@task
+def scrape_failed_chunks():
+    failed = ScrapeHistory.objects.exclude(state=ScrapeHistory.STATE_DONE).all()
+    for each in failed:
+        params = get_params(each.pub_year, hc=each.limit, rs=each.seq_number, state_obj=each)
+        print "REDOING: {}".format(str(params))
+        scrape_chunk.apply_async([params])
+
+
+@task
+def drop_dups():
+    print "Dropping dups!"
+    cursor = connection.cursor()
+    cursor.execute("""DELETE FROM scraper_articlemodel
+    WHERE id IN (SELECT id
+          FROM (SELECT id,
+                     ROW_NUMBER() OVER (partition BY article_id ORDER BY id) AS rnum
+                 FROM scraper_articlemodel) t
+          WHERE t.rnum > 1);""")
+    print "Done dropping dups!"
